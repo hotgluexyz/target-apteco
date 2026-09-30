@@ -48,6 +48,12 @@ tap-blackbaud --config tap.json | target-apteco --config .secrets/config.json
 
 Accepted stream aliases: `Contacts`, `constituents`, `Transactions`, `gifts`, `donations`.
 
+Contacts CSV also forwards segmentation fields from the Blackbaud ETL: `seg_donor_tier`, `seg_interest`, `seg_volunteer`, `tags`.
+
+## Demo: build and show data in Orbit
+
+After a job loads data into the CDP, follow the Connect **Build → Deploy → View System** steps in the tap repo runbook: [`etl-scripts/APTECO_DEMO.md`](https://github.com/hotgluexyz/tap-blackbaud/blob/feature/hgi-11341/etl-scripts/APTECO_DEMO.md) (local path under `tap-blackbaud/etl-scripts/APTECO_DEMO.md`).
+
 ## Development
 
 ```bash

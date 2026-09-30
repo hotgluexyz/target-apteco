@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+import requests
+import singer
+
 from target_apteco.client import AptecoSink
+
+LOGGER = singer.get_logger()
 
 
 def _first(*values: Any) -> Any:
@@ -55,6 +60,14 @@ class ContactsSink(AptecoSink):
     data_source_title = "hotglue-Contacts"
     dedupe_rule_codes = ["SourceURN"]
 
+    # Segmentation columns produced by etl-scripts/etl.py for Apteco CDP attributes.
+    SEGMENTATION_FIELDS = (
+        "seg_donor_tier",
+        "seg_interest",
+        "seg_volunteer",
+        "tags",
+    )
+
     def csv_fieldnames(self) -> List[str]:
         return [
             "Source Unique Reference",
@@ -76,6 +89,10 @@ class ContactsSink(AptecoSink):
             "Primary Address Country Code",
             "Individual Source Create Date",
             "Individual Source Update Date",
+            "seg_donor_tier",
+            "seg_interest",
+            "seg_volunteer",
+            "tags",
         ]
 
     def map_record(self, record: dict) -> dict:
@@ -100,7 +117,7 @@ class ContactsSink(AptecoSink):
         else:
             mobile, landline = phone, None
 
-        return {
+        mapped = {
             "Source Unique Reference": str(
                 _first(record.get("id"), record.get("lookup_id"), record.get("externalId"), record.get("external_id"))
                 or ""
@@ -136,6 +153,86 @@ class ContactsSink(AptecoSink):
             "Individual Source Create Date": _first(record.get("date_added"), record.get("created_at")),
             "Individual Source Update Date": _first(record.get("date_modified"), record.get("updated_at")),
         }
+        for field in self.SEGMENTATION_FIELDS:
+            mapped[field] = record.get(field)
+        return mapped
+
+    def build_table_mapping_columns(self, source_table_id: int) -> List[dict]:
+        """Map core Individuals columns, then attach seg_* as CDP text attributes."""
+        columns = super().build_table_mapping_columns(source_table_id)
+        mapped_eav_ids = {col.get("eavAttributeId") for col in columns if col.get("eavAttributeId")}
+        eav_attributes = self.get_eav_attributes(source_table_id)
+        for attr in eav_attributes:
+            name = attr.get("name")
+            eav_id = attr.get("id")
+            if name not in self.SEGMENTATION_FIELDS or eav_id in mapped_eav_ids:
+                continue
+            attribute_id = self.ensure_individual_text_attribute(name)
+            if attribute_id is None:
+                continue
+            columns.append({"eavAttributeId": eav_id, "attributeId": attribute_id})
+            mapped_eav_ids.add(eav_id)
+            LOGGER.info("Mapped segmentation column %s -> attribute %s", name, attribute_id)
+        return columns
+
+    def ensure_individual_text_attribute(self, description: str) -> Optional[int]:
+        """Create or reuse a selectable text CDP attribute for Individuals."""
+        try:
+            response = requests.get(
+                self.url("CDP/Attributes"),
+                headers=self.authenticator.auth_headers,
+                timeout=60,
+            )
+            if response.ok:
+                for item in response.json() or []:
+                    if item.get("description") == description and not item.get("deletionDate"):
+                        return int(item["attributeId"])
+
+            metas = self.request_api("GET", endpoint="CDP/MetaTables").json() or []
+            meta_table_id = next(
+                (
+                    table["metaTableId"]
+                    for table in metas
+                    if table.get("tableName") in (
+                        "Individual Attributes",
+                        "Individuals",
+                    )
+                ),
+                None,
+            )
+            if meta_table_id is None:
+                # Common Apteco CDP id for individual attributes; best-effort fallback.
+                meta_table_id = 3
+
+            response = requests.post(
+                self.url("CDP/Attributes"),
+                headers={**self.authenticator.auth_headers, "Content-Type": "application/json"},
+                json={
+                    "description": description,
+                    "variableType": "Selector",
+                    "metaTableId": meta_table_id,
+                    "addCodeToDescriptions": False,
+                    "addUnclassified": False,
+                    "selectable": True,
+                    "browseable": True,
+                    "exportable": True,
+                    "exportDescriptions": True,
+                    "included": True,
+                },
+                timeout=60,
+            )
+            if not response.ok:
+                LOGGER.warning(
+                    "Could not create individual attribute %s (%s): %s",
+                    description,
+                    response.status_code,
+                    response.text[:500],
+                )
+                return None
+            return int(response.json()["attributeId"])
+        except Exception as exc:
+            LOGGER.warning("Could not create individual attribute %s: %s", description, exc)
+            return None
 
 
 class ConstituentsSink(ContactsSink):
@@ -174,6 +271,8 @@ class TransactionsSink(AptecoSink):
         return {
             "Source Unique Reference": str(
                 _first(
+                    record.get("contactExternalId"),
+                    record.get("contact_external_id"),
                     record.get("constituent_id"),
                     record.get("contact_id"),
                     record.get("customer_id"),
